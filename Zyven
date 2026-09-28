@@ -1,0 +1,314 @@
+```python
+#!/usr/bin/env python3
+
+"""
+Zyven
+-----
+A fast, minimal endpoint monitor for developers.
+
+Features:
+- Monitor multiple HTTP/HTTPS endpoints
+- Concurrent checks
+- Latency measurement
+- HTTP status validation
+- Configurable timeout
+- Automatic retries
+- JSON output
+- Clean terminal output
+- Zero third-party dependencies
+
+Python 3.11+
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import asdict, dataclass
+from typing import Iterable
+
+
+APP_NAME = "Zyven"
+VERSION = "1.0.0"
+
+
+@dataclass
+class CheckResult:
+    url: str
+    status: str
+    http_code: int | None
+    latency_ms: float | None
+    error: str | None
+    attempts: int
+
+
+def check_endpoint(
+    url: str,
+    timeout: float,
+    retries: int,
+    expected_status: int,
+) -> CheckResult:
+    attempts = 0
+    last_error: str | None = None
+
+    for attempt in range(retries + 1):
+        attempts += 1
+        started = time.perf_counter()
+
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": f"{APP_NAME}/{VERSION}",
+                "Accept": "*/*",
+            },
+            method="GET",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                latency = (time.perf_counter() - started) * 1000
+                code = response.status
+
+                if code == expected_status:
+                    return CheckResult(
+                        url=url,
+                        status="UP",
+                        http_code=code,
+                        latency_ms=round(latency, 2),
+                        error=None,
+                        attempts=attempts,
+                    )
+
+                return CheckResult(
+                    url=url,
+                    status="DEGRADED",
+                    http_code=code,
+                    latency_ms=round(latency, 2),
+                    error=f"Expected HTTP {expected_status}",
+                    attempts=attempts,
+                )
+
+        except urllib.error.HTTPError as exc:
+            latency = (time.perf_counter() - started) * 1000
+
+            if exc.code == expected_status:
+                return CheckResult(
+                    url=url,
+                    status="UP",
+                    http_code=exc.code,
+                    latency_ms=round(latency, 2),
+                    error=None,
+                    attempts=attempts,
+                )
+
+            last_error = f"HTTP {exc.code}"
+
+        except urllib.error.URLError as exc:
+            last_error = str(exc.reason)
+
+        except TimeoutError:
+            last_error = "Connection timed out"
+
+        except Exception as exc:
+            last_error = str(exc)
+
+    return CheckResult(
+        url=url,
+        status="DOWN",
+        http_code=None,
+        latency_ms=None,
+        error=last_error or "Unknown error",
+        attempts=attempts,
+    )
+
+
+def monitor(
+    urls: Iterable[str],
+    timeout: float,
+    retries: int,
+    workers: int,
+    expected_status: int,
+) -> list[CheckResult]:
+    urls = list(dict.fromkeys(urls))
+
+    if not urls:
+        return []
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(workers, len(urls))
+    ) as executor:
+        futures = [
+            executor.submit(
+                check_endpoint,
+                url,
+                timeout,
+                retries,
+                expected_status,
+            )
+            for url in urls
+        ]
+
+        return [future.result() for future in futures]
+
+
+def print_results(results: list[CheckResult]) -> None:
+    print()
+    print(f"{APP_NAME} v{VERSION}")
+    print("-" * 72)
+
+    for result in results:
+        if result.status == "UP":
+            indicator = "[OK]"
+        elif result.status == "DEGRADED":
+            indicator = "[!!]"
+        else:
+            indicator = "[--]"
+
+        latency = (
+            f"{result.latency_ms:.2f} ms"
+            if result.latency_ms is not None
+            else "-"
+        )
+
+        code = str(result.http_code) if result.http_code else "-"
+
+        print(
+            f"{indicator} "
+            f"{result.url:<42} "
+            f"{code:<5} "
+            f"{latency:<12}"
+        )
+
+        if result.error:
+            print(f"      └─ {result.error}")
+
+    print("-" * 72)
+
+    total = len(results)
+    up = sum(r.status == "UP" for r in results)
+    degraded = sum(r.status == "DEGRADED" for r in results)
+    down = sum(r.status == "DOWN" for r in results)
+
+    print(
+        f"Total: {total} | "
+        f"Up: {up} | "
+        f"Degraded: {degraded} | "
+        f"Down: {down}"
+    )
+
+
+def print_json(results: list[CheckResult]) -> None:
+    print(
+        json.dumps(
+            [asdict(result) for result in results],
+            indent=2,
+        )
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="zyven",
+        description="Fast, minimal endpoint monitor for developers.",
+    )
+
+    parser.add_argument(
+        "urls",
+        nargs="+",
+        help="One or more HTTP/HTTPS endpoints to monitor.",
+    )
+
+    parser.add_argument(
+        "-t",
+        "--timeout",
+        type=float,
+        default=5.0,
+        help="Request timeout in seconds. Default: 5",
+    )
+
+    parser.add_argument(
+        "-r",
+        "--retries",
+        type=int,
+        default=1,
+        help="Number of retries after a failed request. Default: 1",
+    )
+
+    parser.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=8,
+        help="Maximum concurrent checks. Default: 8",
+    )
+
+    parser.add_argument(
+        "-s",
+        "--status",
+        type=int,
+        default=200,
+        help="Expected HTTP status code. Default: 200",
+    )
+
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Return results as JSON.",
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
+    )
+
+    return parser
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.timeout <= 0:
+        raise ValueError("Timeout must be greater than 0.")
+
+    if args.retries < 0:
+        raise ValueError("Retries cannot be negative.")
+
+    if args.workers <= 0:
+        raise ValueError("Workers must be greater than 0.")
+
+    if not 100 <= args.status <= 599:
+        raise ValueError("HTTP status must be between 100 and 599.")
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        validate_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    results = monitor(
+        urls=args.urls,
+        timeout=args.timeout,
+        retries=args.retries,
+        workers=args.workers,
+        expected_status=args.status,
+    )
+
+    if args.json:
+        print_json(results)
+    else:
+        print_results(results)
+
+    return 0 if all(r.status == "UP" for r in results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
